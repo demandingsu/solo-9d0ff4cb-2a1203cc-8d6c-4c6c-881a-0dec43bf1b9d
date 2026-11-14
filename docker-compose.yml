@@ -1,7 +1,8 @@
 name: fastq-collector
 
 services:
-  # 模拟测序仪器中转站：分段追加、单端延迟、可中断连接，支持 HTTP Range
+  # 模拟测序仪器中转站：分段追加、单端大幅滞后、可中断连接，支持 HTTP Range。
+  # 打开 http://localhost:8001/docs 可交互式创建"R1 大幅领先、R2 延迟到达"场景。
   relay:
     build:
       context: .
@@ -20,7 +21,8 @@ services:
       timeout: 3s
       retries: 10
 
-  # 采集端：FastAPI + SQLite 增量采集、配对、进度查询与下载
+  # 采集端：FastAPI + SQLite 增量采集、配对、进度查询与下载。
+  # 未配对读段落盘到 SQLite（pending 表），受限内存下也能承受数万条单端超前。
   collector:
     build:
       context: .
@@ -30,10 +32,14 @@ services:
     environment:
       COLLECTOR_DB: /data/collector/collector.db
       COLLECTOR_TIMEOUT: "15"
+      # 单次事务最大配对数，可按内存/写放大权衡调整
+      COLLECTOR_PAIR_BATCH: "500"
     ports:
       - "8000:8000"
     volumes:
       - collector_data:/data/collector
+    # 用于在受限内存下演示：默认放开；设置 COLLECTOR_MEM_LIMIT 可强制压测
+    mem_limit: ${COLLECTOR_MEM_LIMIT:-1g}
     depends_on:
       relay:
         condition: service_healthy
@@ -43,13 +49,16 @@ services:
       timeout: 3s
       retries: 10
 
-  # 一次性端到端演示：自动建场景（含中断）、轮询采集、下载校验
+  # 一次性端到端演示：默认构造 30000 条 R1 领先、R2 延迟到达的场景，
+  # 轮询采集、下载校验并打印两端进度。
   demo:
     image: fastq-collector:latest
     environment:
       RELAY_URL: http://relay:8000
       COLLECTOR_URL: http://collector:8000
       RUN_ID: demo
+      READS: "${DEMO_READS:-30000}"
+      SEQ_LEN: "${DEMO_SEQ_LEN:-120}"
     depends_on:
       relay:
         condition: service_healthy

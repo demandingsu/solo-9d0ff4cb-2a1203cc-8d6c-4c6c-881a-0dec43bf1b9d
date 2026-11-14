@@ -30,13 +30,35 @@ db.init_db(_conn)
 _service = CollectorService(_conn, timeout=HTTP_TIMEOUT)
 
 
+def _read_conn():
+    """每次只读查询用独立短连接。
+
+    采集循环在事件循环线程里长期持有 ``_conn``；若同步端点（FastAPI 会放到
+    线程池执行）复用同一连接，可能触发 sqlite3 的跨线程并发错误。WAL 模式
+    下独立连接能读到已提交快照，开销可忽略。
+    """
+    return db.connect(DB_PATH)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
     await _service.aclose()
 
 
-app = FastAPI(title="双端 FASTQ 增量采集服务", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="双端 FASTQ 增量采集服务",
+    version="1.1.0",
+    description=(
+        "通过 HTTP Range 增量拉取 R1/R2，按读段名配对并持久化到 SQLite。\n\n"
+        "未配对读段写入 `pending` 表（磁盘）而非堆在内存，因此在受限内存下"
+        "也能承受\"R1 领先数万条、R2 尚未写入\"的单端超前；R2 追上后按原顺序"
+        "配对，两端进度在同一事务中一起前推。\n\n"
+        "建议先用中转站的 `POST /demo/large-lead` 创建场景，再把其返回的 "
+        "`absolute_base_url` 填入本服务 `POST /collect/runs` 的 body。"
+    ),
+    lifespan=lifespan,
+)
 
 
 class CollectRequest(BaseModel):
@@ -62,22 +84,34 @@ async def collect(req: CollectRequest):
 
 @app.get("/collect/runs")
 def list_runs():
-    return {"runs": [db.snapshot(r) for r in db.list_runs(_conn)]}
+    conn = _read_conn()
+    try:
+        return {"runs": [db.snapshot(conn, r) for r in db.list_runs(conn)]}
+    finally:
+        conn.close()
 
 
 @app.get("/collect/runs/{run_id}")
 def get_run(run_id: str):
-    row = db.get_run(_conn, run_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"运行 {run_id} 不存在")
-    return db.snapshot(row)
+    conn = _read_conn()
+    try:
+        row = db.get_run(conn, run_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"运行 {run_id} 不存在")
+        return db.snapshot(conn, row)
+    finally:
+        conn.close()
 
 
 @app.get("/collect/runs/{run_id}/R{side:int}")
 def download(run_id: str, side: int):
     if side not in (1, 2):
         raise HTTPException(status_code=404, detail="仅支持 R1 / R2")
-    row = db.get_run(_conn, run_id)
+    peek = _read_conn()
+    try:
+        row = db.get_run(peek, run_id)
+    finally:
+        peek.close()
     if row is None:
         raise HTTPException(status_code=404, detail=f"运行 {run_id} 不存在")
     if row["status"] != "completed":
@@ -90,6 +124,8 @@ def download(run_id: str, side: int):
                 "pairs": row["pairs"],
                 "r1_offset": row["r1_offset"],
                 "r2_offset": row["r2_offset"],
+                "r1_fetched": row["r1_fetched"],
+                "r2_fetched": row["r2_fetched"],
             },
         )
     # 独立连接，避免流式输出期间与采集写事务共用同一连接

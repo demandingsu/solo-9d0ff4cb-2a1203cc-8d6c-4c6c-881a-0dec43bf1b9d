@@ -32,6 +32,14 @@ class Scenario(BaseModel):
     reads: int = Field(20, ge=1, le=100_000)
     append_delay: float = Field(0.15, ge=0, description="每段追加之间的秒数")
     r2_extra_delay: float = Field(0.3, ge=0, description="R2 每段额外滞后秒数")
+    r2_lag_reads: int = Field(
+        0, ge=0,
+        description="R2 始终比 R1 落后的读段条数；大于 reads 时 R1 全部写完才开始写 R2",
+    )
+    r2_start_delay: float = Field(
+        0.0, ge=0,
+        description="R1 全部写完后，R2 追赶前的额外等待秒数（用于让超前窗口可见）",
+    )
     chunk: int = Field(2, ge=1, description="每次追加的读段条数")
     interrupt_at_second: float = Field(
         0.0, ge=0, description=">0 时，启动后该秒自动进入中断窗口"
@@ -73,20 +81,42 @@ async def _writer(state: dict, sc: Scenario):
     try:
         if sc.interrupt_at_second > 0:
             asyncio.create_task(_auto_interrupt(sc.run_id, sc))
-        written = 0
-        while written < sc.reads:
-            nxt = min(written + sc.chunk, sc.reads)
-            blob1 = b"".join(_record(i, 1, sc.seq_len) for i in range(written, nxt))
-            state["r1_bytes"] = await asyncio.to_thread(_flush, r1, blob1, p1)
-            state["r1_reads"] = nxt
-            # 单端滞后：R2 的写入慢半拍
-            await asyncio.sleep(sc.r2_extra_delay)
-            blob2 = b"".join(_record(i, 2, sc.seq_len) for i in range(written, nxt))
-            state["r2_bytes"] = await asyncio.to_thread(_flush, r2, blob2, p2)
-            state["r2_reads"] = nxt
-            written = nxt
-            if written < sc.reads:
+
+        async def write_chunk(fh, path, side, lo, hi):
+            blob = b"".join(_record(i, side, sc.seq_len) for i in range(lo, hi))
+            state[f"r{side}_bytes"] = await asyncio.to_thread(_flush, fh, blob, path)
+            state[f"r{side}_reads"] = hi
+
+        # R1 始终先写、允许领先最多 r2_lag_reads 条；R2 只追到"R1 已写条数 -
+        # r2_lag_reads"为止。r2_lag_reads 取默认 0 时行为与原实现一致：R1 领先
+        # 一个 chunk，等待 r2_extra_delay 后 R2 追平。取大于 reads 时 R1 全部
+        # 落盘后 R2 仍为 0，随后才逐块追赶，用来复现"数万条 R1 领先、R2 尚未
+        # 写入"。R1 写完后 R2 不再受滞后约束，按 append_delay 逐块追上。
+        r1_w = r2_w = 0
+        r2_released = False
+        while r2_w < sc.reads:
+            if r1_w < sc.reads:
+                nxt = min(r1_w + sc.chunk, sc.reads)
+                await write_chunk(r1, p1, 1, r1_w, nxt)
+                r1_w = nxt
                 await asyncio.sleep(sc.append_delay)
+            if (not r2_released and r1_w >= sc.reads
+                    and sc.r2_start_delay > 0):
+                # R1 已全部写完、R2 尚未开始：先按住 R2 一段时间，让
+                # "数万条 R1 已就绪、R2 尚未写入"的超前窗口可被观察到
+                await asyncio.sleep(sc.r2_start_delay)
+            r2_released = r2_released or r1_w >= sc.reads
+            target = sc.reads if r1_w >= sc.reads else min(
+                max(r1_w - sc.r2_lag_reads, 0), sc.reads
+            )
+            if r2_w < target:
+                nxt = min(r2_w + sc.chunk, target)
+                if sc.r2_extra_delay > 0:
+                    await asyncio.sleep(sc.r2_extra_delay)
+                await write_chunk(r2, p2, 2, r2_w, nxt)
+                r2_w = nxt
+                if r2_w < sc.reads:
+                    await asyncio.sleep(sc.append_delay)
         # 全部落盘后再放完成标志
         def _write_done():
             (rdir / "DONE").write_text(
@@ -113,7 +143,19 @@ async def _auto_interrupt(run_id: str, sc: Scenario):
         st["interrupt_until"] = 0.0
 
 
-app = FastAPI(title="仪器中转站（模拟）", version="1.0.0")
+app = FastAPI(
+    title="仪器中转站（模拟）",
+    version="1.0.0",
+    description=(
+        "本地模拟测序仪器中转站：分段追加双端 FASTQ、支持 HTTP Range、"
+        "单端大幅滞后与连接中断。\n\n"
+        "**演示单端超前采集**：调用 `POST /demo/large-lead` 生成"
+        "\"R1 先全部落盘、R2 延迟到达\"的场景，把返回的 `absolute_base_url` "
+        "填入采集端 `POST /collect/runs` 的 body，然后反复查询"
+        "`GET /collect/runs/{id}` 观察 `r1_pending` 上升而 `pairs` 保持 0，"
+        "待 R2 追上后配对并一起前推两端进度。"
+    ),
+)
 
 
 @app.exception_handler(ConnectionResetError)
@@ -133,7 +175,7 @@ def healthz():
 
 
 @app.post("/runs")
-async def create_run(sc: Scenario):
+async def create_run(sc: Scenario, request: Request):
     if sc.run_id in _runs:
         raise HTTPException(status_code=409, detail=f"运行 {sc.run_id} 已存在")
     rdir = _run_dir(sc.run_id)
@@ -150,7 +192,29 @@ async def create_run(sc: Scenario):
     }
     _runs[sc.run_id] = state
     asyncio.create_task(_writer(state, sc))
-    return {"run_id": sc.run_id, "base_url": f"/runs/{sc.run_id}"}
+    return {
+        "run_id": sc.run_id,
+        "base_url": f"/runs/{sc.run_id}",
+        # 供采集端直接使用的绝对地址（/docs 里可一键复制）
+        "absolute_base_url": str(request.base_url).rstrip("/") + f"/runs/{sc.run_id}",
+    }
+
+
+@app.post("/demo/large-lead")
+async def demo_large_lead(request: Request, reads: int = 30_000, seq_len: int = 120):
+    """一键创建"R1 大幅领先、R2 延迟到达"演示场景（供 /docs 使用）。
+
+    生成唯一 run_id，R1 先全部落盘（并含一次连接中断），R2 随后才追赶，
+    返回可直接提交给采集端 ``POST /collect/runs`` 的 base_url。
+    """
+    run_id = f"lead-{int(time.time())}"
+    sc = Scenario(
+        run_id=run_id, reads=reads, append_delay=0.0, r2_extra_delay=0.0,
+        r2_lag_reads=reads, r2_start_delay=3.0,
+        chunk=max(1, reads // 20),
+        interrupt_at_second=0.4, interrupt_duration=1.5, seq_len=seq_len,
+    )
+    return await create_run(sc, request)
 
 
 @app.get("/runs")
